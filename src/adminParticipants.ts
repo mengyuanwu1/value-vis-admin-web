@@ -2,6 +2,7 @@ import type { User } from 'firebase/auth';
 import {
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDocs,
   serverTimestamp,
@@ -12,6 +13,7 @@ import { normalizeAdminEmail } from './adminAccess';
 
 export type SavedParticipant = {
   participantId: string;
+  deploymentStartDate?: string;
 };
 
 function normalizeParticipantId(participantId: string): string {
@@ -38,6 +40,27 @@ function getParticipantDocId(participantId: string): string {
   return normalized;
 }
 
+function cleanDeploymentStartDate(dateKey?: string): string {
+  const cleanDateKey = dateKey?.trim() ?? '';
+  if (!cleanDateKey) return '';
+
+  const match = cleanDateKey.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    throw new Error('Enter deployment start date as YYYY-MM-DD.');
+  }
+
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  if (
+    date.getFullYear() !== Number(match[1])
+    || date.getMonth() !== Number(match[2]) - 1
+    || date.getDate() !== Number(match[3])
+  ) {
+    throw new Error('Enter a valid deployment start date.');
+  }
+
+  return cleanDateKey;
+}
+
 function getRosterCollection(user: User) {
   return collection(db, 'admin_participant_rosters', getAdminEmail(user), 'participants');
 }
@@ -48,15 +71,25 @@ export async function listSavedParticipants(user: User): Promise<SavedParticipan
     .map((item) => {
       const data = item.data();
       const participantId = typeof data.participant_id === 'string' ? data.participant_id : item.id;
-      return { participantId: cleanParticipantId(participantId) };
+      const deploymentStartDate =
+        typeof data.deployment_start_date === 'string' ? cleanDeploymentStartDate(data.deployment_start_date) : '';
+      return {
+        participantId: cleanParticipantId(participantId),
+        ...(deploymentStartDate ? { deploymentStartDate } : {}),
+      };
     })
     .filter((item) => item.participantId.length > 0)
     .sort((left, right) => left.participantId.localeCompare(right.participantId, undefined, { sensitivity: 'base' }));
 }
 
-export async function addSavedParticipant(user: User, participantId: string): Promise<string> {
+export async function addSavedParticipant(
+  user: User,
+  participantId: string,
+  deploymentStartDate?: string,
+): Promise<string> {
   const normalized = getParticipantDocId(participantId);
   const displayParticipantId = cleanParticipantId(participantId);
+  const cleanDateKey = cleanDeploymentStartDate(deploymentStartDate);
   await setDoc(
     doc(getRosterCollection(user), normalized),
     {
@@ -65,10 +98,29 @@ export async function addSavedParticipant(user: User, participantId: string): Pr
       added_by_uid: user.uid,
       added_at: serverTimestamp(),
       updated_at: serverTimestamp(),
+      ...(cleanDateKey ? { deployment_start_date: cleanDateKey } : {}),
     },
     { merge: true },
   );
   return displayParticipantId;
+}
+
+export async function updateSavedParticipantDeploymentStartDate(
+  user: User,
+  participantId: string,
+  deploymentStartDate: string,
+): Promise<string> {
+  const normalized = getParticipantDocId(participantId);
+  const cleanDateKey = cleanDeploymentStartDate(deploymentStartDate);
+  await setDoc(
+    doc(getRosterCollection(user), normalized),
+    {
+      deployment_start_date: cleanDateKey || deleteField(),
+      updated_at: serverTimestamp(),
+    },
+    { merge: true },
+  );
+  return cleanDateKey;
 }
 
 export async function removeSavedParticipant(user: User, participantId: string): Promise<string> {

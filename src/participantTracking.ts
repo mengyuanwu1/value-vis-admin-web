@@ -23,11 +23,34 @@ export function getFixedParticipantUserId(participantId: string): string | null 
 
 export type TrackingTone = 'good' | 'warning' | 'critical' | 'neutral';
 
+export type TrackingTrendPoint = {
+  dateKey: string;
+  value: number | null;
+  secondaryValue?: number | null;
+};
+
+export type TrackingTrend = {
+  valueLabel: string;
+  valueUnit: string;
+  secondaryValueLabel?: string;
+  secondaryValueUnit?: string;
+  suggestedMax?: number;
+  points: TrackingTrendPoint[];
+};
+
+export type TrackingCompletionPoint = {
+  dateKey: string;
+  completed: boolean;
+  isToday: boolean;
+};
+
 export type TrackingMetric = {
   label: string;
   value: string;
   detail?: string;
   tone: TrackingTone;
+  trend?: TrackingTrend;
+  completionHistory?: TrackingCompletionPoint[];
 };
 
 export type TrackingAlert = {
@@ -100,6 +123,22 @@ function dateKeyToDate(dateKey: string): Date | null {
   return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
 }
 
+function addDays(date: Date, days: number): Date {
+  const nextDate = new Date(date);
+  nextDate.setDate(date.getDate() + days);
+  return nextDate;
+}
+
+function normalizeDate(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function diffCalendarDays(startDate: Date, endDate: Date): number {
+  const start = normalizeDate(startDate).getTime();
+  const end = normalizeDate(endDate).getTime();
+  return Math.floor((end - start) / (24 * 60 * 60 * 1000));
+}
+
 function getRecentDateKeys(todayKey: string, count: number): string[] {
   const start = dateKeyToDate(todayKey) ?? new Date();
   return Array.from({ length: count }, (_, index) => {
@@ -107,6 +146,19 @@ function getRecentDateKeys(todayKey: string, count: number): string[] {
     date.setDate(start.getDate() - index);
     return formatDateKey(date);
   });
+}
+
+function getTrackingDateKeys(startDate: Date | null, todayKey: string, maxDays = 35): string[] {
+  const today = dateKeyToDate(todayKey);
+  if (!startDate || !today) return [...getRecentDateKeys(todayKey, 14)].reverse();
+
+  const normalizedStart = normalizeDate(startDate);
+  const totalDays = diffCalendarDays(normalizedStart, today) + 1;
+  if (totalDays <= 0) return [];
+
+  const cappedDays = Math.min(totalDays, maxDays);
+  const rangeStart = addDays(today, -(cappedDays - 1));
+  return Array.from({ length: cappedDays }, (_, index) => formatDateKey(addDays(rangeStart, index)));
 }
 
 function daysSince(date: Date | null): number | null {
@@ -169,29 +221,70 @@ async function getLatestCollectionDocs(userId: string, collectionName: string, m
   return snapshot.docs.map((item) => ({ id: item.id, data: item.data() }));
 }
 
-function completionRate(completedDates: Set<string>, todayKey: string, days: number): number {
-  const keys = getRecentDateKeys(todayKey, days);
-  return Math.round((keys.filter((key) => completedDates.has(key)).length / days) * 100);
+function completionRateForDateKeys(completedDates: Set<string>, dateKeys: string[], days: number): number {
+  const keys = dateKeys.slice(-days);
+  if (keys.length === 0) return 0;
+  return Math.round((keys.filter((key) => completedDates.has(key)).length / keys.length) * 100);
 }
 
-function streakDays(completedDates: Set<string>, todayKey: string): number {
-  let streak = 0;
-  for (const key of getRecentDateKeys(todayKey, 30)) {
-    if (!completedDates.has(key)) break;
-    streak += 1;
-  }
-  return streak;
+function buildCompletionHistory(
+  completedDates: Set<string>,
+  dateKeys: string[],
+  todayKey: string,
+): TrackingCompletionPoint[] {
+  return dateKeys.map((dateKey) => ({
+    dateKey,
+    completed: completedDates.has(dateKey),
+    isToday: dateKey === todayKey,
+  }));
+}
+
+function getWeeklyComplianceStatus(completedDates: Set<string>, startDate: Date | null, todayKey: string) {
+  const today = dateKeyToDate(todayKey);
+  if (!startDate || !today) return null;
+
+  const normalizedStart = normalizeDate(startDate);
+  const daysFromStart = diffCalendarDays(normalizedStart, today);
+  if (daysFromStart < 0) return null;
+  const studyWeek = Math.min(4, Math.floor(daysFromStart / 7) + 1);
+  const target = studyWeek < 4 ? 4 : 2;
+  const weekStart = addDays(normalizedStart, (studyWeek - 1) * 7);
+  const weekDateKeys = Array.from({ length: 7 }, (_, index) => formatDateKey(addDays(weekStart, index)));
+  const completed = weekDateKeys.filter((dateKey) => completedDates.has(dateKey)).length;
+  const remainingOpportunity = weekDateKeys.filter(
+    (dateKey) => dateKey >= todayKey && !completedDates.has(dateKey),
+  ).length;
+
+  return {
+    completed,
+    remainingOpportunity,
+    studyWeek,
+    target,
+    onTrack: completed + remainingOpportunity >= target,
+  };
 }
 
 function buildAlerts(params: {
   onboardingComplete: boolean;
   fitbitConnected: boolean;
   latestHealthDate: Date | null;
-  rehearsalToday: boolean;
-  reflectionToday: boolean;
+  completedScheduleDates: Set<string>;
+  completedReflectionDates: Set<string>;
+  startDate: Date | null;
+  todayKey: string;
 }): TrackingAlert[] {
   const alerts: TrackingAlert[] = [];
   const healthAge = daysSince(params.latestHealthDate);
+  const rehearsalStatus = getWeeklyComplianceStatus(
+    params.completedScheduleDates,
+    params.startDate,
+    params.todayKey,
+  );
+  const reflectionStatus = getWeeklyComplianceStatus(
+    params.completedReflectionDates,
+    params.startDate,
+    params.todayKey,
+  );
 
   if (!params.onboardingComplete) {
     alerts.push({
@@ -213,17 +306,17 @@ function buildAlerts(params: {
       tone: 'warning',
     });
   }
-  if (!params.rehearsalToday) {
+  if (rehearsalStatus && !rehearsalStatus.onTrack) {
     alerts.push({
-      title: 'Daily rehearsal missing',
-      detail: 'No completed daily schedule record for today.',
+      title: 'Daily rehearsal off track',
+      detail: `Week ${rehearsalStatus.studyWeek}: ${rehearsalStatus.completed}/${rehearsalStatus.target} complete with ${rehearsalStatus.remainingOpportunity} days left.`,
       tone: 'warning',
     });
   }
-  if (!params.reflectionToday) {
+  if (reflectionStatus && !reflectionStatus.onTrack) {
     alerts.push({
-      title: 'Daily reflection missing',
-      detail: 'No completed value reflection record for today.',
+      title: 'Daily reflection off track',
+      detail: `Week ${reflectionStatus.studyWeek}: ${reflectionStatus.completed}/${reflectionStatus.target} complete with ${reflectionStatus.remainingOpportunity} days left.`,
       tone: 'warning',
     });
   }
@@ -242,6 +335,7 @@ export function getLookupErrorMessage(error: unknown): string {
 export async function lookupParticipantTracking(
   participantId: string,
   todayKey = formatDateKey(new Date()),
+  deploymentStartDateKey = '',
 ): Promise<ParticipantTrackingSummary | null> {
   const normalizedParticipantId = participantId.trim();
   if (!normalizedParticipantId) return null;
@@ -254,21 +348,31 @@ export async function lookupParticipantTracking(
   const demo = asRecord(userData.demo);
   const onboarding = asRecord(userData.onboarding);
   const integrations = asRecord(userData.integrations);
+  const deploymentStartDate = deploymentStartDateKey ? dateKeyToDate(deploymentStartDateKey) : null;
+  const participantStartDate = deploymentStartDate ?? toDate(userData.createdAt);
+  const trackingDateKeys = getTrackingDateKeys(participantStartDate, todayKey);
+  const trackingDateSet = new Set(trackingDateKeys);
+  const trackingDayCount = Math.max(14, trackingDateKeys.length);
 
-  const [todayScheduleDoc, todayReflectionDoc, recentSchedules, recentReflections, latestHealthDocs] =
+  const [todayScheduleDoc, todayReflectionDoc, recentSchedules, recentReflections, recentHealthDocs] =
     await Promise.all([
       getDoc(doc(db, 'users', userId, 'daily_schedules', todayKey)),
       getDoc(doc(db, 'users', userId, 'value_reflections', `reflection-daily-${todayKey}`)),
-      getLatestCollectionDocs(userId, 'daily_schedules', 14),
-      getLatestCollectionDocs(userId, 'value_reflections', 14),
-      getLatestCollectionDocs(userId, 'health_days', 1),
+      getLatestCollectionDocs(userId, 'daily_schedules', trackingDayCount),
+      getLatestCollectionDocs(userId, 'value_reflections', trackingDayCount),
+      getLatestCollectionDocs(userId, 'health_days', trackingDayCount),
     ]);
 
   const todaySchedule = todayScheduleDoc.exists() ? todayScheduleDoc.data() : null;
   const todayReflection = todayReflectionDoc.exists() ? todayReflectionDoc.data() : null;
-  const latestHealth = latestHealthDocs[0]?.data ?? null;
+  const latestHealthDoc = recentHealthDocs.find((item) => {
+    const healthDay = asRecord(item.data);
+    const dateKey = asString(healthDay.date, asString(healthDay.snapshot_date, item.id));
+    return trackingDateSet.has(dateKey);
+  });
+  const latestHealth = latestHealthDoc?.data ?? null;
   const latestHealthDate = latestHealth
-    ? dateKeyToDate(asString(latestHealth.date, asString(latestHealth.snapshot_date, latestHealthDocs[0]?.id ?? '')))
+    ? dateKeyToDate(asString(latestHealth.date, asString(latestHealth.snapshot_date, latestHealthDoc?.id ?? '')))
     : null;
   const latestHealthSyncedAt =
     toDate(asRecord(latestHealth).synced_at) ?? toDate(asRecord(latestHealth).updatedAt);
@@ -286,16 +390,26 @@ export async function lookupParticipantTracking(
       .filter(Boolean),
   );
 
+  const healthByDate = new Map<string, Record<string, unknown>>();
+  for (const item of recentHealthDocs) {
+    const healthDay = asRecord(item.data);
+    const dateKey = asString(healthDay.date, asString(healthDay.snapshot_date, item.id));
+    if (dateKey) healthByDate.set(dateKey, healthDay);
+  }
+
   const onboardingComplete = asBoolean(onboarding.onboarding_complete);
   const demographicsComplete = asBoolean(onboarding.demographics_completed);
   const valueQuizComplete = asBoolean(onboarding.value_quiz_completed);
-  const smartGoalComplete = asBoolean(onboarding.SMART_goal_complete);
   const fitbitConnected = asBoolean(integrations.fitbit_connected);
-  const rehearsalToday = asString(todaySchedule?.status) === 'completed';
-  const reflectionToday = todayReflectionDoc.exists();
+  const trackingHasStarted = trackingDateSet.has(todayKey);
+  const rehearsalToday = trackingHasStarted && asString(todaySchedule?.status) === 'completed';
+  const reflectionToday = trackingHasStarted && todayReflectionDoc.exists();
   const sleep = asRecord(latestHealth?.sleep);
   const activity = asRecord(latestHealth?.activity);
   const vitals = asRecord(latestHealth?.vitals);
+
+  if (rehearsalToday) completedScheduleDates.add(todayKey);
+  if (reflectionToday) completedReflectionDates.add(todayKey);
 
   const setup: TrackingMetric[] = [
     {
@@ -316,19 +430,36 @@ export async function lookupParticipantTracking(
       detail: formatRelativeDate(toDate(onboarding.value_quiz_completed_at)),
       tone: toneFromBoolean(valueQuizComplete),
     },
-    {
-      label: 'Goal setup',
-      value: statusFromBoolean(smartGoalComplete),
-      detail: asString(onboarding.SMART_goal_stage, 'not_started'),
-      tone: toneFromBoolean(smartGoalComplete),
-    },
   ];
 
   const sleepHours = asNumber(sleep.hours);
   const sleepEfficiency = asNumber(sleep.efficiency);
   const steps = asNumber(activity.steps);
   const restingHeartRate = asNumber(vitals.resting_heart_rate);
-  const healthFresh = latestHealthDate && (daysSince(latestHealthDate) ?? 99) <= 2;
+  const chartDateKeys = trackingDateKeys;
+  const fitbitTrendPoints: TrackingTrendPoint[] = chartDateKeys.map((dateKey) => ({
+    dateKey,
+    value: healthByDate.has(dateKey) ? 1 : null,
+  }));
+  const sleepTrendPoints: TrackingTrendPoint[] = chartDateKeys.map((dateKey) => {
+    const healthDay = healthByDate.get(dateKey);
+    const daySleep = asRecord(healthDay?.sleep);
+    return {
+      dateKey,
+      value: asNumber(daySleep.hours),
+      secondaryValue: asNumber(daySleep.efficiency),
+    };
+  });
+  const activityTrendPoints: TrackingTrendPoint[] = chartDateKeys.map((dateKey) => {
+    const healthDay = healthByDate.get(dateKey);
+    const dayActivity = asRecord(healthDay?.activity);
+    const dayVitals = asRecord(healthDay?.vitals);
+    return {
+      dateKey,
+      value: asNumber(dayActivity.steps),
+      secondaryValue: asNumber(dayVitals.resting_heart_rate),
+    };
+  });
 
   const dataFlow: TrackingMetric[] = [
     {
@@ -336,35 +467,46 @@ export async function lookupParticipantTracking(
       value: fitbitConnected ? 'Connected' : 'Disconnected',
       detail: latestHealthSyncedAt ? `Synced ${formatRelativeDate(latestHealthSyncedAt).toLowerCase()}` : 'No sync record',
       tone: fitbitConnected ? 'good' : 'critical',
-    },
-    {
-      label: 'Health data date',
-      value: latestHealthDate ? formatDateKey(latestHealthDate) : 'Missing',
-      detail: formatRelativeDate(latestHealthDate),
-      tone: healthFresh ? 'good' : 'warning',
+      trend: {
+        valueLabel: 'Health day',
+        valueUnit: 'record',
+        suggestedMax: 1,
+        points: fitbitTrendPoints,
+      },
     },
     {
       label: 'Sleep',
       value: sleepHours !== null ? `${sleepHours.toFixed(1)}h` : 'Missing',
       detail: sleepEfficiency !== null ? `${sleepEfficiency}% efficiency` : undefined,
       tone: sleepHours !== null ? 'good' : 'warning',
+      trend: {
+        valueLabel: 'Sleep',
+        valueUnit: 'h',
+        secondaryValueLabel: 'Efficiency',
+        secondaryValueUnit: '%',
+        suggestedMax: 10,
+        points: sleepTrendPoints,
+      },
     },
     {
-      label: 'Activity/vitals',
+      label: 'Activity',
       value: steps !== null ? `${Math.round(steps).toLocaleString()} steps` : 'Missing',
       detail: restingHeartRate !== null ? `${Math.round(restingHeartRate)} bpm resting HR` : 'Resting HR missing',
       tone: steps !== null || restingHeartRate !== null ? 'good' : 'warning',
+      trend: {
+        valueLabel: 'Steps',
+        valueUnit: 'steps',
+        secondaryValueLabel: 'Resting HR',
+        secondaryValueUnit: 'bpm',
+        points: activityTrendPoints,
+      },
     },
   ];
 
-  const rehearsalRate = completionRate(completedScheduleDates, todayKey, 7);
-  const reflectionRate = completionRate(completedReflectionDates, todayKey, 7);
-  const reflectionWords = todayReflection
-    ? [
-        asString(todayReflection.went_well, asString(todayReflection.wentWell)),
-        asString(todayReflection.could_improve, asString(todayReflection.couldImprove)),
-      ].join(' ').trim().split(/\s+/).filter(Boolean).length
-    : 0;
+  const rehearsalRate = completionRateForDateKeys(completedScheduleDates, trackingDateKeys, 7);
+  const reflectionRate = completionRateForDateKeys(completedReflectionDates, trackingDateKeys, 7);
+  const rehearsalHistory = buildCompletionHistory(completedScheduleDates, trackingDateKeys, todayKey);
+  const reflectionHistory = buildCompletionHistory(completedReflectionDates, trackingDateKeys, todayKey);
 
   const dailyCompliance: TrackingMetric[] = [
     {
@@ -372,24 +514,14 @@ export async function lookupParticipantTracking(
       value: statusFromBoolean(rehearsalToday, 'Done today', 'Missing today'),
       detail: `7-day rate ${rehearsalRate}%`,
       tone: toneFromBoolean(rehearsalToday),
+      completionHistory: rehearsalHistory,
     },
     {
       label: 'Daily reflection',
       value: statusFromBoolean(reflectionToday, 'Done today', 'Missing today'),
       detail: `7-day rate ${reflectionRate}%`,
       tone: toneFromBoolean(reflectionToday),
-    },
-    {
-      label: 'Rehearsal streak',
-      value: `${streakDays(completedScheduleDates, todayKey)} days`,
-      detail: 'Consecutive completed daily records',
-      tone: streakDays(completedScheduleDates, todayKey) > 0 ? 'good' : 'warning',
-    },
-    {
-      label: 'Reflection content',
-      value: todayReflection ? `${reflectionWords} words` : 'Missing',
-      detail: todayReflection ? 'Saved in Firestore' : 'No Firestore record',
-      tone: todayReflection ? 'good' : 'warning',
+      completionHistory: reflectionHistory,
     },
   ];
 
@@ -397,8 +529,10 @@ export async function lookupParticipantTracking(
     onboardingComplete,
     fitbitConnected,
     latestHealthDate,
-    rehearsalToday,
-    reflectionToday,
+    completedScheduleDates,
+    completedReflectionDates,
+    startDate: participantStartDate,
+    todayKey,
   });
 
   return {
@@ -407,7 +541,7 @@ export async function lookupParticipantTracking(
     displayName: asString(userData.displayName, 'Unknown'),
     email: asString(userData.email, 'No email'),
     cohort: asString(userData.cohort, asString(asRecord(userData.study).cohort, 'Not set')),
-    startDate: toDate(userData.createdAt),
+    startDate: participantStartDate,
     setup,
     dataFlow,
     dailyCompliance,

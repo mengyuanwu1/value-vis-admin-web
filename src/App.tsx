@@ -15,17 +15,21 @@ import {
   addSavedParticipant,
   listSavedParticipants,
   removeSavedParticipant,
+  updateSavedParticipantDeploymentStartDate,
 } from './adminParticipants';
 import { auth, googleProvider } from './firebase';
 import {
+  formatDateKey,
   getFixedParticipantUserId,
   getLookupErrorMessage,
   lookupParticipantTracking,
   type ParticipantTrackingSummary,
   type TrackingActivity,
   type TrackingAlert,
+  type TrackingCompletionPoint,
   type TrackingMetric,
   type TrackingTone,
+  type TrackingTrend,
 } from './participantTracking';
 
 const toneLabels: Record<TrackingTone, string> = {
@@ -44,6 +48,7 @@ const toneClass: Record<TrackingTone, string> = {
 
 type ParticipantRosterRow = {
   participantId: string;
+  deploymentStartDate?: string;
   status: 'loading' | 'loaded' | 'error';
   summary?: ParticipantTrackingSummary;
   message?: string;
@@ -165,6 +170,76 @@ function PanelIcon({ children }: { children: string }) {
   return <span className="panel-icon" aria-hidden="true">{children}</span>;
 }
 
+function formatDateKeyForDisplay(dateKey: string): string {
+  const match = dateKey.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return dateKey;
+  return `${Number(match[2])}/${Number(match[3])}`;
+}
+
+function formatTrendValue(value: number | null | undefined, unit: string): string {
+  if (value === null || value === undefined) return 'Missing';
+  if (unit === 'steps') return `${Math.round(value).toLocaleString()} steps`;
+  if (unit === 'h') return `${value.toFixed(1)}h`;
+  if (unit === '%') return `${Math.round(value)}%`;
+  if (unit === 'bpm') return `${Math.round(value)} bpm`;
+  return unit ? `${Math.round(value).toLocaleString()} ${unit}` : Math.round(value).toLocaleString();
+}
+
+function TrendChart({ trend }: { trend: TrackingTrend }) {
+  const values = trend.points.flatMap((point) => (point.value === null ? [] : [point.value]));
+  const maxValue = Math.max(trend.suggestedMax ?? 0, ...values, 1);
+
+  return (
+    <div className="trend-card">
+      <div className="trend-chart" aria-label={`${trend.valueLabel} history by day`}>
+        {trend.points.map((point) => {
+          const height = point.value === null ? 0 : Math.max(8, Math.min(100, (point.value / maxValue) * 100));
+          const primary = formatTrendValue(point.value, trend.valueUnit);
+          const secondary = trend.secondaryValueLabel
+            ? `${trend.secondaryValueLabel}: ${formatTrendValue(point.secondaryValue, trend.secondaryValueUnit ?? '')}`
+            : '';
+          const title = `${point.dateKey}: ${trend.valueLabel} ${primary}${secondary ? `, ${secondary}` : ''}`;
+
+          return (
+            <div className="trend-column" key={point.dateKey} title={title}>
+              <div className="trend-bar-track">
+                {point.value === null ? (
+                  <span className="trend-missing" aria-label={`${point.dateKey} missing`} />
+                ) : (
+                  <span className="trend-bar" style={{ height: `${height}%` }} />
+                )}
+              </div>
+              <span className="trend-axis-label">{formatDateKeyForDisplay(point.dateKey)}</span>
+            </div>
+          );
+        })}
+      </div>
+      <div className="trend-legend">
+        <span>{trend.valueLabel}</span>
+        {trend.secondaryValueLabel ? <span>{trend.secondaryValueLabel} shown on hover</span> : null}
+      </div>
+    </div>
+  );
+}
+
+function CompletionDots({ points }: { points: TrackingCompletionPoint[] }) {
+  const completed = points.filter((point) => point.completed).length;
+
+  return (
+    <div className="completion-dots" aria-label={`${completed} of ${points.length} days complete`}>
+      {points.map((point) => (
+        <span
+          className={`completion-dot ${point.completed ? 'completion-dot-complete' : 'completion-dot-missing'} ${
+            point.isToday ? 'completion-dot-today' : ''
+          }`}
+          key={point.dateKey}
+          title={`${point.dateKey}: ${point.completed ? 'Done' : 'Missing'}`}
+        />
+      ))}
+    </div>
+  );
+}
+
 function MetricPanel({
   title,
   icon,
@@ -174,6 +249,9 @@ function MetricPanel({
   icon: string;
   metrics: TrackingMetric[];
 }) {
+  const [activeTrendLabel, setActiveTrendLabel] = useState<string | null>(null);
+  const activeTrendMetric = metrics.find((metric) => metric.label === activeTrendLabel && metric.trend);
+
   return (
     <section className="panel" aria-labelledby={`${title.replace(/\s+/g, '-').toLowerCase()}-title`}>
       <div className="panel-header">
@@ -181,18 +259,40 @@ function MetricPanel({
         <h2 id={`${title.replace(/\s+/g, '-').toLowerCase()}-title`}>{title}</h2>
       </div>
       <div className="metric-list">
-        {metrics.map((metric) => (
-          <div className="metric-row" key={metric.label}>
-            <div>
-              <div className="metric-label">{metric.label}</div>
-              {metric.detail ? <div className="metric-detail">{metric.detail}</div> : null}
+        {metrics.map((metric) => {
+          const rowBody = (
+            <>
+              <div>
+                <div className="metric-label">{metric.label}</div>
+                {metric.detail ? <div className="metric-detail">{metric.detail}</div> : null}
+                {metric.completionHistory ? <CompletionDots points={metric.completionHistory} /> : null}
+              </div>
+              <div className={`metric-value ${toneClass[metric.tone]}`}>
+                <StatusDot tone={metric.tone} />
+                <span>{metric.value}</span>
+              </div>
+            </>
+          );
+
+          return metric.trend ? (
+            <button
+              aria-expanded={activeTrendMetric?.label === metric.label}
+              className={`metric-row metric-row-button ${
+                activeTrendMetric?.label === metric.label ? 'selected-metric-row' : ''
+              }`}
+              key={metric.label}
+              type="button"
+              onClick={() => setActiveTrendLabel((current) => (current === metric.label ? null : metric.label))}
+            >
+              {rowBody}
+            </button>
+          ) : (
+            <div className="metric-row" key={metric.label}>
+              {rowBody}
             </div>
-            <div className={`metric-value ${toneClass[metric.tone]}`}>
-              <StatusDot tone={metric.tone} />
-              <span>{metric.value}</span>
-            </div>
-          </div>
-        ))}
+          );
+        })}
+        {activeTrendMetric?.trend ? <TrendChart trend={activeTrendMetric.trend} /> : null}
       </div>
     </section>
   );
@@ -279,7 +379,7 @@ function ParticipantOverview({ summary }: { summary: ParticipantTrackingSummary 
             {summary.displayName} <span aria-hidden="true">/</span> {summary.email}
           </p>
           <p>
-            Cohort {summary.cohort} <span aria-hidden="true">/</span> Started {formatDate(summary.startDate)}
+            Cohort {summary.cohort} <span aria-hidden="true">/</span> Tracking start {formatDate(summary.startDate)}
           </p>
         </div>
         <div className="participant-status">
@@ -309,6 +409,7 @@ function ParticipantRosterPanel({
   onSelect,
   onRefresh,
   onRemove,
+  onUpdateDeploymentStartDate,
 }: {
   rows: ParticipantRosterRow[];
   selectedParticipantId: string;
@@ -316,6 +417,7 @@ function ParticipantRosterPanel({
   onSelect: (row: ParticipantRosterRow) => void;
   onRefresh: () => void;
   onRemove: (participantId: string) => void;
+  onUpdateDeploymentStartDate: (participantId: string, deploymentStartDate: string) => void;
 }) {
   return (
     <section className="panel roster-panel" aria-labelledby="participant-roster-title">
@@ -339,6 +441,7 @@ function ParticipantRosterPanel({
               <tr>
                 <th>Participant</th>
                 <th>Name</th>
+                <th>Deployment</th>
                 <th>Onboarding</th>
                 <th>Fitbit</th>
                 <th>Rehearsal</th>
@@ -372,6 +475,18 @@ function ParticipantRosterPanel({
                       {row.status === 'error' ? <div className="row-error">{row.message}</div> : null}
                     </td>
                     <td>{summary?.displayName ?? (row.status === 'loading' ? 'Loading...' : 'Not found')}</td>
+                    <td>
+                      <input
+                        aria-label={`Deployment start date for ${row.participantId}`}
+                        className="table-date-input"
+                        disabled={busy}
+                        max={formatDateKey(new Date())}
+                        type="date"
+                        value={row.deploymentStartDate ?? ''}
+                        onChange={(event) => onUpdateDeploymentStartDate(row.participantId, event.target.value)}
+                        onClick={(event) => event.stopPropagation()}
+                      />
+                    </td>
                     <td>{onboarding?.value ?? '-'}</td>
                     <td>{fitbit?.value ?? '-'}</td>
                     <td>{rehearsal?.value ?? '-'}</td>
@@ -661,6 +776,7 @@ function SettingsWorkspace({
 
 export default function App() {
   const [participantId, setParticipantId] = useState(getInitialParticipantId);
+  const [deploymentStartDate, setDeploymentStartDate] = useState('');
   const [submittedId, setSubmittedId] = useState('');
   const [summary, setSummary] = useState<ParticipantTrackingSummary | null>(null);
   const [lookupState, setLookupState] = useState<'idle' | 'loading' | 'loaded' | 'empty' | 'error'>('idle');
@@ -685,15 +801,18 @@ export default function App() {
   );
   const localhostAuthUrl = useMemo(getLocalhostAuthUrl, []);
 
-  async function resolveParticipantRows(participantIds: string[]): Promise<ParticipantRosterRow[]> {
+  async function resolveParticipantRows(
+    participantItems: Array<{ participantId: string; deploymentStartDate?: string }>,
+  ): Promise<ParticipantRosterRow[]> {
     return Promise.all(
-      participantIds.map(async (id) => {
+      participantItems.map(async ({ participantId: id, deploymentStartDate }) => {
         try {
-          const nextSummary = await lookupParticipantTracking(id);
+          const nextSummary = await lookupParticipantTracking(id, undefined, deploymentStartDate);
           if (!nextSummary) {
             const fixedUserId = getFixedParticipantUserId(id);
             return {
               participantId: id,
+              deploymentStartDate,
               status: 'error' as const,
               message: fixedUserId
                 ? `Recognized as ${fixedUserId}, but the user document was not found or readable.`
@@ -703,12 +822,14 @@ export default function App() {
 
           return {
             participantId: nextSummary.participantId,
+            deploymentStartDate,
             status: 'loaded' as const,
             summary: nextSummary,
           };
         } catch (error) {
           return {
             participantId: id,
+            deploymentStartDate,
             status: 'error' as const,
             message: getLookupErrorMessage(error),
           };
@@ -726,9 +847,8 @@ export default function App() {
     setRosterBusy(true);
     try {
       const saved = await listSavedParticipants(nextUser);
-      const participantIds = saved.map((item) => item.participantId);
-      setRosterRows(participantIds.map((id) => ({ participantId: id, status: 'loading' })));
-      const rows = await resolveParticipantRows(participantIds);
+      setRosterRows(saved.map((item) => ({ ...item, status: 'loading' })));
+      const rows = await resolveParticipantRows(saved);
       setRosterRows(rows);
 
       if (summary) {
@@ -814,8 +934,8 @@ export default function App() {
     setSubmittedId(normalizedId);
 
     try {
-      await addSavedParticipant(user, normalizedId);
-      const result = await lookupParticipantTracking(normalizedId);
+      await addSavedParticipant(user, normalizedId, deploymentStartDate);
+      const result = await lookupParticipantTracking(normalizedId, undefined, deploymentStartDate);
       if (!result) {
         const fixedUserId = getFixedParticipantUserId(normalizedId);
         setLookupState('empty');
@@ -830,6 +950,7 @@ export default function App() {
       setSummary(result);
       setLookupState('loaded');
       setParticipantId('');
+      setDeploymentStartDate('');
       await loadRoster(user);
     } catch (error) {
       setLookupState('error');
@@ -860,6 +981,30 @@ export default function App() {
       if (summary?.participantId === nextParticipantId) {
         setSummary(null);
         setSubmittedId('');
+      }
+      await loadRoster(user);
+    } catch (error) {
+      setLookupState('error');
+      setLookupMessage(getLookupErrorMessage(error));
+    } finally {
+      setRosterBusy(false);
+    }
+  }
+
+  async function handleUpdateDeploymentStartDate(nextParticipantId: string, nextDeploymentStartDate: string) {
+    if (!user) return;
+
+    setRosterBusy(true);
+    setLookupMessage('');
+    try {
+      const savedDate = await updateSavedParticipantDeploymentStartDate(
+        user,
+        nextParticipantId,
+        nextDeploymentStartDate,
+      );
+      if (summary?.participantId === nextParticipantId) {
+        const refreshedSummary = await lookupParticipantTracking(nextParticipantId, undefined, savedDate);
+        setSummary(refreshedSummary);
       }
       await loadRoster(user);
     } catch (error) {
@@ -913,15 +1058,29 @@ export default function App() {
               <p>Add participant IDs to your tracking table, then click a row to inspect the full backend status.</p>
             </div>
             <form className="search-form" onSubmit={handleSearch}>
-              <label htmlFor="participant-id">Participant ID</label>
+              <div className="search-fields">
+                <label htmlFor="participant-id">
+                  Participant ID
+                  <input
+                    id="participant-id"
+                    autoComplete="off"
+                    placeholder="P12345"
+                    value={participantId}
+                    onChange={(event) => setParticipantId(event.target.value)}
+                  />
+                </label>
+                <label htmlFor="deployment-start-date">
+                  Deployment start
+                  <input
+                    id="deployment-start-date"
+                    max={formatDateKey(new Date())}
+                    type="date"
+                    value={deploymentStartDate}
+                    onChange={(event) => setDeploymentStartDate(event.target.value)}
+                  />
+                </label>
+              </div>
               <div className="search-controls">
-                <input
-                  id="participant-id"
-                  autoComplete="off"
-                  placeholder="P12345"
-                  value={participantId}
-                  onChange={(event) => setParticipantId(event.target.value)}
-                />
                 <button className="primary-button" type="submit" disabled={!canSearch}>
                   <SearchIcon />
                   {lookupState === 'loading' ? 'Adding' : 'Add Participant'}
@@ -941,6 +1100,9 @@ export default function App() {
               onSelect={handleSelectRosterRow}
               onRefresh={() => void loadRoster(user)}
               onRemove={(nextParticipantId) => void handleRemoveRosterParticipant(nextParticipantId)}
+              onUpdateDeploymentStartDate={(nextParticipantId, nextDeploymentStartDate) => {
+                void handleUpdateDeploymentStartDate(nextParticipantId, nextDeploymentStartDate);
+              }}
             />
           ) : null}
 
