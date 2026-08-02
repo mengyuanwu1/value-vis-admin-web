@@ -354,16 +354,29 @@ export async function lookupParticipantTracking(
   const trackingDateSet = new Set(trackingDateKeys);
   const trackingDayCount = Math.max(14, trackingDateKeys.length);
 
-  const [todayScheduleDoc, todayReflectionDoc, recentSchedules, recentReflections, recentHealthDocs] =
+  const [
+    todayScheduleDoc,
+    todayDailyReflectionDoc,
+    todayLegacyReflectionDoc,
+    recentSchedules,
+    recentDailyReflections,
+    recentLegacyReflections,
+    recentHealthDocs,
+  ] =
     await Promise.all([
       getDoc(doc(db, 'users', userId, 'daily_schedules', todayKey)),
+      getDoc(doc(db, 'users', userId, 'daily_reflections', todayKey)),
       getDoc(doc(db, 'users', userId, 'value_reflections', `reflection-daily-${todayKey}`)),
       getLatestCollectionDocs(userId, 'daily_schedules', trackingDayCount),
+      getLatestCollectionDocs(userId, 'daily_reflections', trackingDayCount),
       getLatestCollectionDocs(userId, 'value_reflections', trackingDayCount),
       getLatestCollectionDocs(userId, 'health_days', trackingDayCount),
     ]);
 
   const todaySchedule = todayScheduleDoc.exists() ? todayScheduleDoc.data() : null;
+  const todayReflectionDoc = todayDailyReflectionDoc.exists()
+    ? todayDailyReflectionDoc
+    : todayLegacyReflectionDoc;
   const todayReflection = todayReflectionDoc.exists() ? todayReflectionDoc.data() : null;
   const latestHealthDoc = recentHealthDocs.find((item) => {
     const healthDay = asRecord(item.data);
@@ -384,8 +397,7 @@ export async function lookupParticipantTracking(
       .filter(Boolean),
   );
   const completedReflectionDates = new Set(
-    recentReflections
-      .filter((item) => asString(item.data.scope) === 'daily')
+    [...recentDailyReflections, ...recentLegacyReflections.filter((item) => asString(item.data.scope) === 'daily')]
       .map((item) => asString(item.data.date, item.id.replace(/^reflection-daily-/, '')))
       .filter(Boolean),
   );
